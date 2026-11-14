@@ -1,0 +1,27 @@
+[package]
+name = "ligraph"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["hypengw <hypengwip@gmail.com>"]
+
+[lib]
+name = "ligraph"
+module = "ligraph"
+archive = "ligraph"
+
+[[test]]
+name = "ligraph-tests"
+sources = ["tests/main.cpp"]
+link-stdlib = false
+
+[dependencies]
+rstd-alloc = { version = "0.1.12", pub = true }
+
+[dev-dependencies]
+rstd-std = { version = "0.1.12" }
+rstd-test = { version = "0.1.12" }
+rstd-nostd = { version = "0.1.12", usage = "link" }
+
+[profile.base]
+exceptions = false
+rtti = false
