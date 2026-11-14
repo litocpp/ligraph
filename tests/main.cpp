@@ -267,3 +267,92 @@ TEST(Graph, DfsMoveKeepsActiveNeighborViewsAlive) {
     EXPECT_EQ(moved.next().unwrap().unwrap(), usize(1));
     EXPECT_TRUE(moved.next().is_none());
 }
+
+struct BorrowedNode {
+    usize       slot;
+    unsigned    generation;
+    friend auto operator==(BorrowedNode, BorrowedNode) -> bool = default;
+};
+
+TEST(Graph, TypedTraversalPreservesGenerationsAndCycles) {
+    auto graph = ligraph::traversal_view<BorrowedNode, usize>(
+        [](BorrowedNode) -> Result<empty, usize> {
+            return Ok(empty {});
+        },
+        [](BorrowedNode node) {
+            auto neighbors =
+                rstd::iter::once(BorrowedNode { node.slot, node.generation == 1 ? 2u : 1u });
+            return Result<decltype(neighbors), usize>(Ok(rstd::move(neighbors)));
+        });
+    Vec<BorrowedNode> roots;
+    roots.push(BorrowedNode { usize(), 1 });
+    auto visited = Vec<BorrowedNode>::make();
+    auto visit   = [&visited](BorrowedNode node) {
+        if (visited.iter().any([&](auto item) {
+                return *item == node;
+            }))
+            return false;
+        visited.push(BorrowedNode(node));
+        return true;
+    };
+    auto breadth = ligraph::bfs(graph, roots.as_slice(), visit).unwrap();
+    EXPECT_EQ(breadth.next().unwrap().unwrap().generation, 1u);
+    EXPECT_EQ(breadth.next().unwrap().unwrap().generation, 2u);
+    EXPECT_TRUE(breadth.next().is_none());
+    EXPECT_EQ(visited.len(), usize(2));
+    visited.clear();
+    auto depth = ligraph::dfs(graph, roots.as_slice(), visit).unwrap();
+    EXPECT_EQ(depth.next().unwrap().unwrap().generation, 1u);
+    auto moved = rstd::move(depth);
+    EXPECT_EQ(moved.next().unwrap().unwrap().generation, 2u);
+    EXPECT_TRUE(moved.next().is_none());
+}
+
+struct TraversalFailure {
+    Box<usize> payload;
+};
+
+TEST(Graph, FallibleTraversalTransfersOwnedErrorsAndStops) {
+    for (bool breadth : { false, true }) {
+        Option<TraversalFailure> failure = Some(TraversalFailure { Box<usize>::make(usize(77)) });
+        auto                     graph   = ligraph::traversal_view<usize, TraversalFailure>(
+            [](usize) -> Result<empty, TraversalFailure> {
+                return Ok(empty {});
+            },
+            [&failure](
+                usize node) -> Result<decltype(rstd::iter::once(usize())), TraversalFailure> {
+                if (node == usize(1)) return Err(failure.take().unwrap());
+                return Ok(rstd::iter::once(usize(1)));
+            });
+        Vec<usize> roots;
+        roots.push(usize());
+        auto check = [&](auto traversal) {
+            EXPECT_EQ(traversal.next().unwrap().unwrap(), usize());
+            auto failed = traversal.next().unwrap();
+            ASSERT_TRUE(failed.is_err());
+            EXPECT_EQ(*failed.unwrap_err().payload, usize(77));
+            EXPECT_TRUE(failure.is_none());
+            EXPECT_TRUE(traversal.next().is_none());
+            EXPECT_TRUE(traversal.next().is_none());
+        };
+        if (breadth)
+            check(ligraph::bfs(graph, roots.as_slice(), ligraph::DenseVisitMap(usize(2))).unwrap());
+        else
+            check(ligraph::dfs(graph, roots.as_slice(), ligraph::DenseVisitMap(usize(2))).unwrap());
+    }
+    auto rejected = ligraph::traversal_view<usize, usize>(
+        [](usize node) -> Result<empty, usize> {
+            return Err(usize(node));
+        },
+        [](usize) -> Result<decltype(rstd::iter::empty<usize>()), usize> {
+            return Ok(rstd::iter::empty<usize>());
+        });
+    Vec<usize> roots;
+    roots.push(usize(9));
+    EXPECT_EQ(
+        ligraph::bfs(rejected, roots.as_slice(), ligraph::DenseVisitMap(usize())).unwrap_err(),
+        usize(9));
+    EXPECT_EQ(
+        ligraph::dfs(rejected, roots.as_slice(), ligraph::DenseVisitMap(usize())).unwrap_err(),
+        usize(9));
+}

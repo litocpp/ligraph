@@ -203,28 +203,66 @@ auto toposort_min(const G& graph, TopoWorkspace& workspace) -> Result<Vec<usize>
     return workspace.sort_min(graph);
 }
 
-template<IndexedGraph G>
-class Bfs : public rstd::DefaultInClass<Bfs<G>, rstd::iter::Iterator> {
-    G                                     graph_;
-    Vec<bool>                             seen_;
-    ::alloc::collections::VecDeque<usize> pending_;
-    bool                                  done_ {};
-    explicit Bfs(G graph): graph_(rstd::move(graph)) {}
+template<class G>
+concept TraversalGraph = requires(const G& graph, typename G::NodeId node) {
+    typename G::Error;
+    typename G::Neighbors;
+    requires rstd::mtp::init<typename G::NodeId, const typename G::NodeId&>;
+    requires rstd::iter::has_next<typename G::Neighbors>;
+    requires rstd::mtp::same_as<typename G::Neighbors::Item, typename G::NodeId>;
+    { graph.check_node(node) } -> rstd::mtp::same_as<rstd::Result<empty, typename G::Error>>;
+    {
+        graph.neighbors(node)
+    } -> rstd::mtp::same_as<rstd::Result<typename G::Neighbors, typename G::Error>>;
+};
+
+template<class N, class E, class Check, class Next>
+class TraversalView {
+    Check check_;
+    Next  next_;
+
+public:
+    using NodeId = N;
+    using Error  = E;
+    using Neighbors =
+        typename decltype(rstd::mtp::declval<const Next&>()(rstd::mtp::declval<N>()))::value_type;
+    TraversalView(Check check, Next next): check_(rstd::move(check)), next_(rstd::move(next)) {}
+    auto check_node(N node) const -> rstd::Result<empty, E> { return check_(node); }
+    auto neighbors(N node) const -> rstd::Result<Neighbors, E> { return next_(node); }
+};
+
+template<class N, class E, class Check, class Next>
+    requires TraversalGraph<TraversalView<N, E, Check, Next>>
+auto traversal_view(Check check, Next next) -> TraversalView<N, E, Check, Next> {
+    return { rstd::move(check), rstd::move(next) };
+}
+
+// The visit callable is invoked only after check_node succeeds. True means newly visited.
+template<class Visit, class G>
+concept VisitMapFor = TraversalGraph<G> && requires(Visit& visit, typename G::NodeId node) {
+    { visit(node) } -> rstd::mtp::same_as<bool>;
+};
+
+template<TraversalGraph G, VisitMapFor<G> Visit>
+class TryBfs : public rstd::DefaultInClass<TryBfs<G, Visit>, rstd::iter::Iterator> {
+    using Node  = typename G::NodeId;
+    using Error = typename G::Error;
+    G                                    graph_;
+    Visit                                visit_;
+    ::alloc::collections::VecDeque<Node> pending_;
+    bool                                 done_ {};
+    TryBfs(G graph, Visit visit): graph_(rstd::move(graph)), visit_(rstd::move(visit)) {}
     auto view() const -> const G& { return graph_; }
 
 public:
-    using Item                         = Result<usize>;
+    using Item                         = rstd::Result<Node, Error>;
     static constexpr bool PROVEN_FUSED = true;
-    static auto           make(G graph, slice<usize> roots) -> Result<Bfs> {
-        Bfs  result(rstd::move(graph));
-        auto count = result.view().node_count();
-        result.seen_.resize(count, false);
+    static auto make(G graph, slice<Node> roots, Visit visit) -> rstd::Result<TryBfs, Error> {
+        TryBfs result(rstd::move(graph), rstd::move(visit));
         for (auto root : roots) {
-            if (root >= count) return Err(Error { ErrorKind::InvalidNode, root, {} });
-            if (! result.seen_[root]) {
-                result.seen_[root] = true;
-                result.pending_.push_back(usize(root));
-            }
+            auto checked = result.view().check_node(root);
+            if (checked.is_err()) return Err(rstd::move(checked).unwrap_err());
+            if (result.visit_(root)) result.pending_.push_back(Node(root));
         }
         return Ok(rstd::move(result));
     }
@@ -235,59 +273,64 @@ public:
             done_ = true;
             return None();
         }
-        auto neighbors = view().neighbors(*node);
-        while (auto next = neighbors.next()) {
-            if (*next >= seen_.len()) {
-                done_ = true;
-                return Some(Item(Err(Error { ErrorKind::InvalidNode, *next, {} })));
-            }
-            if (! seen_[*next]) {
-                seen_[*next] = true;
-                pending_.push_back(*next);
-            }
+        auto expanded = view().neighbors(*node);
+        if (expanded.is_err()) {
+            done_ = true;
+            return Some(Item(Err(rstd::move(expanded).unwrap_err())));
         }
-        return Some(Item(Ok(*node)));
+        auto neighbors = rstd::move(expanded).unwrap();
+        while (auto next = neighbors.next()) {
+            auto checked = view().check_node(*next);
+            if (checked.is_err()) {
+                done_ = true;
+                return Some(Item(Err(rstd::move(checked).unwrap_err())));
+            }
+            if (visit_(*next)) pending_.push_back(Node(*next));
+        }
+        return Some(Item(Ok(Node(*node))));
     }
 };
 
-template<IndexedGraph G>
-auto bfs(G graph, slice<usize> roots) -> Result<Bfs<G>> {
-    return Bfs<G>::make(rstd::move(graph), roots);
+template<TraversalGraph G, VisitMapFor<G> Visit>
+auto bfs(G graph, slice<typename G::NodeId> roots, Visit visit)
+    -> rstd::Result<TryBfs<G, Visit>, typename G::Error> {
+    return TryBfs<G, Visit>::make(rstd::move(graph), roots, rstd::move(visit));
 }
 
-template<IndexedGraph G>
-class Dfs : public rstd::DefaultInClass<Dfs<G>, rstd::iter::Iterator> {
-    using Neighbors = decltype(rstd::mtp::declval<const G&>().neighbors(usize()));
+template<TraversalGraph G, VisitMapFor<G> Visit>
+class TryDfs : public rstd::DefaultInClass<TryDfs<G, Visit>, rstd::iter::Iterator> {
+    using Node  = typename G::NodeId;
+    using Error = typename G::Error;
     struct Frame {
-        Neighbors neighbors;
+        typename G::Neighbors neighbors;
     };
     // Active neighbor iterators may borrow the view itself across traversal moves.
     Box<G>     graph_;
-    Vec<bool>  seen_;
-    Vec<usize> roots_;
+    Visit      visit_;
+    Vec<Node>  roots_;
     usize      root_ {};
     Vec<Frame> frames_;
     bool       done_ {};
-    explicit Dfs(G graph): graph_(Box<G>::make(rstd::move(graph))) {}
+    TryDfs(G graph, Visit visit)
+        : graph_(Box<G>::make(rstd::move(graph))), visit_(rstd::move(visit)) {}
     auto view() const -> const G& { return *graph_; }
 
 public:
-    using Item                         = Result<usize>;
+    using Item                         = rstd::Result<Node, Error>;
     static constexpr bool PROVEN_FUSED = true;
-    static auto           make(G graph, slice<usize> roots) -> Result<Dfs> {
-        Dfs  result(rstd::move(graph));
-        auto count = result.view().node_count();
-        result.seen_.resize(count, false);
+    static auto make(G graph, slice<Node> roots, Visit visit) -> rstd::Result<TryDfs, Error> {
+        TryDfs result(rstd::move(graph), rstd::move(visit));
         for (auto root : roots) {
-            if (root >= count) return Err(Error { ErrorKind::InvalidNode, root, {} });
-            result.roots_.push(usize(root));
+            auto checked = result.view().check_node(root);
+            if (checked.is_err()) return Err(rstd::move(checked).unwrap_err());
+            result.roots_.push(Node(root));
         }
         return Ok(rstd::move(result));
     }
     auto next() -> Option<Item> {
         if (done_) return None();
         for (;;) {
-            Option<usize> node;
+            Option<Node> node;
             if (! frames_.is_empty()) {
                 node = frames_.last_mut().unwrap().get_mut().neighbors.next();
                 if (! node) {
@@ -299,18 +342,100 @@ public:
                     done_ = true;
                     return None();
                 }
-                node = Some(usize(roots_[root_++]));
+                node = Some(Node(roots_[root_++]));
             }
-            if (*node >= seen_.len()) {
+            auto checked = view().check_node(*node);
+            if (checked.is_err()) {
                 done_ = true;
-                return Some(Item(Err(Error { ErrorKind::InvalidNode, *node, {} })));
+                return Some(Item(Err(rstd::move(checked).unwrap_err())));
             }
-            if (seen_[*node]) continue;
-            seen_[*node] = true;
-            frames_.push({ view().neighbors(*node) });
-            return Some(Item(Ok(*node)));
+            if (! visit_(*node)) continue;
+            auto expanded = view().neighbors(*node);
+            if (expanded.is_err()) {
+                done_ = true;
+                return Some(Item(Err(rstd::move(expanded).unwrap_err())));
+            }
+            frames_.push({ rstd::move(expanded).unwrap() });
+            return Some(Item(Ok(Node(*node))));
         }
     }
+};
+
+template<TraversalGraph G, VisitMapFor<G> Visit>
+auto dfs(G graph, slice<typename G::NodeId> roots, Visit visit)
+    -> rstd::Result<TryDfs<G, Visit>, typename G::Error> {
+    return TryDfs<G, Visit>::make(rstd::move(graph), roots, rstd::move(visit));
+}
+
+class DenseVisitMap {
+    Vec<bool> seen_;
+
+public:
+    explicit DenseVisitMap(usize count) { seen_.resize(count, false); }
+    auto operator()(usize node) -> bool {
+        if (seen_[node]) return false;
+        seen_[node] = true;
+        return true;
+    }
+};
+
+template<IndexedGraph G>
+class CheckedIndexedGraph {
+    G graph_;
+
+public:
+    using NodeId    = usize;
+    using Error     = ligraph::Error;
+    using Neighbors = decltype(rstd::mtp::declval<const G&>().neighbors(usize()));
+    explicit CheckedIndexedGraph(G graph): graph_(rstd::move(graph)) {}
+    auto check_node(usize node) const -> Result<empty> {
+        if (node >= graph_.node_count()) return Err(Error { ErrorKind::InvalidNode, node, {} });
+        return Ok(empty {});
+    }
+    auto neighbors(usize node) const -> Result<Neighbors> { return Ok(graph_.neighbors(node)); }
+};
+
+template<IndexedGraph G>
+class Bfs : public rstd::DefaultInClass<Bfs<G>, rstd::iter::Iterator> {
+    using Inner = TryBfs<CheckedIndexedGraph<G>, DenseVisitMap>;
+    Inner inner_;
+    explicit Bfs(Inner inner): inner_(rstd::move(inner)) {}
+
+public:
+    using Item                         = Result<usize>;
+    static constexpr bool PROVEN_FUSED = true;
+    static auto           make(G graph, slice<usize> roots) -> Result<Bfs> {
+        auto count = static_cast<const G&>(graph).node_count();
+        auto traversal =
+            Inner::make(CheckedIndexedGraph<G>(rstd::move(graph)), roots, DenseVisitMap(count));
+        if (traversal.is_err()) return Err(rstd::move(traversal).unwrap_err());
+        return Ok(Bfs(rstd::move(traversal).unwrap()));
+    }
+    auto next() -> Option<Item> { return inner_.next(); }
+};
+
+template<IndexedGraph G>
+auto bfs(G graph, slice<usize> roots) -> Result<Bfs<G>> {
+    return Bfs<G>::make(rstd::move(graph), roots);
+}
+
+template<IndexedGraph G>
+class Dfs : public rstd::DefaultInClass<Dfs<G>, rstd::iter::Iterator> {
+    using Inner = TryDfs<CheckedIndexedGraph<G>, DenseVisitMap>;
+    Inner inner_;
+    explicit Dfs(Inner inner): inner_(rstd::move(inner)) {}
+
+public:
+    using Item                         = Result<usize>;
+    static constexpr bool PROVEN_FUSED = true;
+    static auto           make(G graph, slice<usize> roots) -> Result<Dfs> {
+        auto count = static_cast<const G&>(graph).node_count();
+        auto traversal =
+            Inner::make(CheckedIndexedGraph<G>(rstd::move(graph)), roots, DenseVisitMap(count));
+        if (traversal.is_err()) return Err(rstd::move(traversal).unwrap_err());
+        return Ok(Dfs(rstd::move(traversal).unwrap()));
+    }
+    auto next() -> Option<Item> { return inner_.next(); }
 };
 
 template<IndexedGraph G>
