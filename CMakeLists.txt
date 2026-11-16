@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.29)
 
-project(ligraph VERSION 0.1.0 LANGUAGES CXX)
+project(ligraph VERSION 0.1.1 LANGUAGES CXX)
 
 add_library(ligraph STATIC)
 add_library(ligraph::ligraph ALIAS ligraph)
